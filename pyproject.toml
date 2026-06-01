@@ -1,0 +1,21 @@
+[project]
+name = "wellbore-geology-prediction"
+version = "0.1.0"
+description = "Drillbotics competition: predict wellbore geology from horizontal well logs and typewell data"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2",
+    "pandas>=2",
+    "scikit-learn>=1.5",
+    "scipy>=1.14",
+    "matplotlib>=3.9",
+    "jupyter>=1",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
