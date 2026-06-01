@@ -1,7 +1,12 @@
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
-from scipy.spatial.distance import cdist
+from dtaidistance import dtw
+
+WINDOWS = [5, 15, 30, 60, 120]
+
+CORR_LAGS = list(range(-60, 61, 5))
+DTW_WINDOW = 30
 
 
 def impute_col(df: pd.DataFrame, col: str, key: str = "MD") -> pd.DataFrame:
@@ -57,119 +62,194 @@ def compute_well_geometry(hw: pd.DataFrame) -> pd.DataFrame:
         * 100
     )
     hw["dls"] = dls.fillna(0)
-
     hw["curvature"] = dls / dmd.replace(0, np.nan)
     hw["curvature"] = hw["curvature"].fillna(0)
-
     return hw
 
 
-def build_typewell_features(
-    hw: pd.DataFrame, tw: pd.DataFrame, method: str = "nearest"
-) -> pd.DataFrame:
-    hw = hw.copy()
-    hw_gr = hw["GR"].values
-    tw_gr = tw["GR"].values
-    tw_tvt = tw["TVT"].values
-
-    if method == "nearest":
-        from scipy.spatial import KDTree
-
-        tree = KDTree(tw_gr.reshape(-1, 1))
-        best_dist, best_idx = tree.query(hw_gr.reshape(-1, 1), k=1)
-        best_idx = best_idx.ravel()
-        best_dist = best_dist.ravel()
-    else:
-        dist = cdist(hw_gr.reshape(-1, 1), tw_gr.reshape(-1, 1), metric="euclidean")
-        best_idx = dist.argmin(axis=1)
-        best_dist = dist.min(axis=1)
-
-    hw["tw_tvt_match"] = tw_tvt[best_idx]
-    hw["tw_gr_match"] = tw_gr[best_idx]
-    hw["tw_gr_dist"] = best_dist
-    hw["tw_gr_sim"] = np.exp(-best_dist / (best_dist.std() + 1e-8))
-
-    return hw
+def interpolate_typewell_gr(typewell_df, lateral_md: np.ndarray) -> np.ndarray:
+    if typewell_df is None or typewell_df.empty:
+        return np.full(len(lateral_md), np.nan)
+    tw_depth_col = next(
+        (c for c in typewell_df.columns if c in ("TVT", "depth", "tvd", "md", "depth_m")), None
+    )
+    tw_gr_col = next((c for c in typewell_df.columns if c in ("GR", "gamma_ray", "gr_api")), None)
+    if tw_depth_col is None or tw_gr_col is None:
+        return np.full(len(lateral_md), np.nan)
+    tw = typewell_df[[tw_depth_col, tw_gr_col]].dropna().sort_values(tw_depth_col)
+    if len(tw) < 2:
+        return np.full(len(lateral_md), np.nan)
+    f = interp1d(
+        tw[tw_depth_col].values,
+        tw[tw_gr_col].values,
+        bounds_error=False,
+        fill_value=(tw[tw_gr_col].iloc[0], tw[tw_gr_col].iloc[-1]),
+    )
+    return f(lateral_md)
 
 
-def add_window_features(
-    hw: pd.DataFrame, col: str = "GR", windows: list | None = None
-) -> pd.DataFrame:
-    hw = hw.copy()
-    if windows is None:
-        windows = [5, 11, 21, 51]
-    for w in windows:
-        hw[f"{col}_mean_{w}"] = hw[col].rolling(w, center=True, min_periods=1).mean()
-        hw[f"{col}_std_{w}"] = hw[col].rolling(w, center=True, min_periods=1).std().fillna(0)
-        hw[f"{col}_min_{w}"] = hw[col].rolling(w, center=True, min_periods=1).min()
-        hw[f"{col}_max_{w}"] = hw[col].rolling(w, center=True, min_periods=1).max()
-        p = hw[col].rolling(w, center=True, min_periods=1)
-        hw[f"{col}_p25_{w}"] = p.quantile(0.25)
-        hw[f"{col}_p75_{w}"] = p.quantile(0.75)
-    return hw
+def rolling_gr_features(gr: np.ndarray, md: np.ndarray) -> pd.DataFrame:
+    s = pd.Series(gr)
+    out = {"md": md, "md_norm": (md - md.min()) / (md.max() - md.min() + 1e-9)}
+
+    out["gr"] = gr
+    out["gr_grad"] = np.gradient(gr, md)
+    out["gr_grad2"] = np.gradient(out["gr_grad"], md)
+    out["gr_pct_rank"] = s.rank(pct=True).values
+
+    for w in WINDOWS:
+        r = s.rolling(w, center=True, min_periods=1)
+        out[f"gr_mean_{w}"] = r.mean().values
+        out[f"gr_std_{w}"] = r.std().fillna(0).values
+        out[f"gr_min_{w}"] = r.min().values
+        out[f"gr_max_{w}"] = r.max().values
+        out[f"gr_range_{w}"] = out[f"gr_max_{w}"] - out[f"gr_min_{w}"]
+
+    return pd.DataFrame(out)
+
+
+def xcorr_best_lag(
+    lateral_gr: np.ndarray,
+    tw_gr: np.ndarray,
+    center: int,
+    half_win: int = DTW_WINDOW,
+    lags: list = CORR_LAGS,
+) -> dict:
+    lo = max(0, center - half_win)
+    hi = min(len(lateral_gr), center + half_win)
+    win = lateral_gr[lo:hi]
+    if len(win) < 5:
+        return {"xcorr_best_lag": 0.0, "xcorr_best_corr": 0.0, "xcorr_mean_corr": 0.0}
+    corrs = []
+    for lag in lags:
+        tlo = max(0, lo + lag)
+        thi = min(len(tw_gr), hi + lag)
+        if thi - tlo != len(win):
+            corrs.append(0.0)
+            continue
+        tw_win = tw_gr[tlo:thi]
+        if tw_win.std() < 1e-6 or win.std() < 1e-6:
+            corrs.append(0.0)
+        else:
+            corrs.append(np.corrcoef(win, tw_win)[0, 1])
+    best_idx = int(np.argmax(corrs))
+    return {
+        "xcorr_best_lag": float(lags[best_idx]),
+        "xcorr_best_corr": float(corrs[best_idx]),
+        "xcorr_mean_corr": float(np.mean(corrs)),
+    }
+
+
+def compute_dtw(
+    lateral_gr: np.ndarray, tw_gr: np.ndarray, center: int, half_win: int = DTW_WINDOW
+) -> dict:
+    lo = max(0, center - half_win)
+    hi = min(len(lateral_gr), center + half_win)
+    win_lat = lateral_gr[lo:hi].astype(np.float64)
+    win_tw = tw_gr[lo:hi].astype(np.float64)
+    if len(win_lat) < 5 or np.isnan(win_tw).any():
+        return {"dtw_dist": np.nan, "dtw_norm_dist": np.nan}
+
+    def norm01(x):
+        r = x.max() - x.min()
+        return (x - x.min()) / (r + 1e-9)
+
+    d = dtw.distance_fast(norm01(win_lat), norm01(win_tw), window=half_win // 2)
+    return {"dtw_dist": float(d), "dtw_norm_dist": float(d / len(win_lat))}
 
 
 def build_features(hw: pd.DataFrame, tw: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
-    hw = impute_gr(hw)
-    hw = impute_tvt_input(hw)
-    hw = compute_well_geometry(hw)
-    hw = build_typewell_features(hw, tw)
-    hw = add_window_features(hw)
+    hw = hw.sort_values("MD").copy()
+    md = hw["MD"].values
+    gr = impute_gr(hw)["GR"].values
 
-    geom_cols = ["inclination_deg", "azimuth_deg", "dls", "curvature"]
-    tw_cols = ["tw_tvt_match", "tw_gr_match", "tw_gr_dist", "tw_gr_sim"]
-    window_cols = [c for c in hw.columns if c.startswith("GR_")]
+    feat = rolling_gr_features(gr, md)
 
-    base_features = ["MD", "X", "Y", "Z", "GR", "TVT_input", "TVT_input_missing"]
-    feature_cols = base_features + geom_cols + tw_cols + window_cols
+    tw_gr = interpolate_typewell_gr(tw, md)
+    xcorr_rows = [xcorr_best_lag(gr, tw_gr, i) for i in range(len(md))]
+    dtw_rows = [compute_dtw(gr, tw_gr, i) for i in range(len(md))]
 
-    keep_cols = [c for c in feature_cols if c in hw.columns]
-    result = hw[keep_cols].copy()
+    feat = pd.concat(
+        [
+            feat,
+            pd.DataFrame(xcorr_rows),
+            pd.DataFrame(dtw_rows),
+        ],
+        axis=1,
+    )
+
+    feat["tw_gr"] = tw_gr
+    feat["gr_tw_diff"] = gr - tw_gr
+    feat["gr_tw_ratio"] = gr / (tw_gr + 1e-9)
+
+    if is_train:
+        hw = impute_tvt_input(hw)
+        hw = compute_well_geometry(hw)
+        feat["TVT_input"] = hw["TVT_input"].values
+        feat["TVT_input_missing"] = hw["TVT_input_missing"].values
+        feat["inclination_deg"] = hw["inclination_deg"].values
+        feat["azimuth_deg"] = hw["azimuth_deg"].values
+        feat["dls"] = hw["dls"].values
+        feat["curvature"] = hw["curvature"].values
 
     if is_train and "TVT" in hw.columns:
-        result["TVT"] = hw["TVT"].values
+        feat["TVT"] = hw["TVT"].values
 
-    return result
+    return feat
 
 
 FEATURE_COLS = [
-    "MD",
-    "X",
-    "Y",
-    "Z",
-    "GR",
+    "md",
+    "md_norm",
+    "gr",
+    "gr_grad",
+    "gr_grad2",
+    "gr_pct_rank",
+    "gr_mean_5",
+    "gr_std_5",
+    "gr_min_5",
+    "gr_max_5",
+    "gr_range_5",
+    "gr_mean_15",
+    "gr_std_15",
+    "gr_min_15",
+    "gr_max_15",
+    "gr_range_15",
+    "gr_mean_30",
+    "gr_std_30",
+    "gr_min_30",
+    "gr_max_30",
+    "gr_range_30",
+    "gr_mean_60",
+    "gr_std_60",
+    "gr_min_60",
+    "gr_max_60",
+    "gr_range_60",
+    "gr_mean_120",
+    "gr_std_120",
+    "gr_min_120",
+    "gr_max_120",
+    "gr_range_120",
+    "xcorr_best_lag",
+    "xcorr_best_corr",
+    "xcorr_mean_corr",
+    "dtw_dist",
+    "dtw_norm_dist",
+    "tw_gr",
+    "gr_tw_diff",
+    "gr_tw_ratio",
     "TVT_input",
     "TVT_input_missing",
     "inclination_deg",
     "azimuth_deg",
     "dls",
     "curvature",
-    "tw_tvt_match",
-    "tw_gr_match",
-    "tw_gr_dist",
-    "tw_gr_sim",
-    "GR_mean_5",
-    "GR_std_5",
-    "GR_min_5",
-    "GR_max_5",
-    "GR_p25_5",
-    "GR_p75_5",
-    "GR_mean_11",
-    "GR_std_11",
-    "GR_min_11",
-    "GR_max_11",
-    "GR_p25_11",
-    "GR_p75_11",
-    "GR_mean_21",
-    "GR_std_21",
-    "GR_min_21",
-    "GR_max_21",
-    "GR_p25_21",
-    "GR_p75_21",
-    "GR_mean_51",
-    "GR_std_51",
-    "GR_min_51",
-    "GR_max_51",
-    "GR_p25_51",
-    "GR_p75_51",
 ]
+
+
+def smooth_tvt(preds: np.ndarray, window: int = 31, poly: int = 3) -> np.ndarray:
+    if len(preds) < window:
+        return preds
+    from scipy.signal import savgol_filter
+
+    return savgol_filter(preds, window_length=window, polyorder=poly)

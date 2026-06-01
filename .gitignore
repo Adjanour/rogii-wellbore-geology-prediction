@@ -25,4 +25,5 @@ submission.csv
 *.json
 *.ubj
 *.pkl
+*.onnx
 !model_checkpoint.json

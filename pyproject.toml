@@ -1,6 +1,6 @@
 [project]
 name = "wellbore-geology-prediction"
-version = "0.1.0"
+version = "0.2.0"
 description = "Drillbotics competition: predict wellbore geology from horizontal well logs and typewell data"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,6 +10,15 @@ dependencies = [
     "scipy>=1.14",
     "matplotlib>=3.9",
     "jupyter>=1",
+    "lightgbm>=4",
+    "dtaidistance>=2",
+]
+
+[project.optional-dependencies]
+edge = [
+    "onnxruntime>=1.18",
+    "skl2onnx>=1.16",
+    "onnxmltools>=1.11",
 ]
 
 [tool.pytest.ini_options]
